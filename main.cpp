@@ -106,6 +106,7 @@ struct Config {
     bool        no_index   = false;
     ColorMode   color      = ColorMode::Auto;
     char        delimiter  = 0;    // 0 = table mode; '\t' or ',' = delimited output
+    bool        no_header  = false;
 };
 
 static void print_usage(const char* prog) {
@@ -121,6 +122,7 @@ static void print_usage(const char* prog) {
         "  --tsv              write tab-separated values to stdout\n"
         "  --csv              write comma-separated values to stdout\n"
         "  --delimiter <sep>  write with a custom single-character delimiter\n"
+        "  --no-header        omit the header row from delimited output\n"
         "  (with delimited output -n defaults to all rows; -c still applies)\n"
         "\n  -h                 show this help\n",
         prog);
@@ -134,6 +136,8 @@ static Config parse_args(int argc, char** argv) {
             print_usage(argv[0]); std::exit(0);
         } else if (!std::strcmp(argv[i], "--no-index")) {
             cfg.no_index = true;
+        } else if (!std::strcmp(argv[i], "--no-header")) {
+            cfg.no_header = true;
         } else if (!std::strcmp(argv[i], "-n") && i + 1 < argc) {
             cfg.head_rows = std::atoi(argv[++i]);
         } else if (!std::strcmp(argv[i], "-w") && i + 1 < argc) {
@@ -388,11 +392,13 @@ static void write_delimited(parquet::arrow::FileReader* reader,
     for (int i = 0; i < show_cols; ++i) col_indices.push_back(i);
 
     // Header row
-    for (int ci = 0; ci < show_cols; ++ci) {
-        if (ci) std::putchar(sep);
-        write_csv_field(schema->field(ci)->name(), sep);
+    if (!cfg.no_header) {
+        for (int ci = 0; ci < show_cols; ++ci) {
+            if (ci) std::putchar(sep);
+            write_csv_field(schema->field(ci)->name(), sep);
+        }
+        std::putchar('\n');
     }
-    std::putchar('\n');
 
     // Data rows — one row group at a time
     for (int rg = 0; rg < meta->num_row_groups() && rows_left > 0; ++rg) {
