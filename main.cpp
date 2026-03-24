@@ -11,30 +11,111 @@
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
-#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
+
+// ── Colors ────────────────────────────────────────────────────────────────────
+
+struct Colors {
+    const char* reset      = "";
+    const char* border     = "";   // table lines
+    const char* header     = "";   // column name row
+    const char* row_idx    = "";   // row index column
+    const char* null_val   = "";   // null cells
+    const char* number     = "";   // numeric / temporal values
+    const char* bool_true  = "";   // true
+    const char* bool_false = "";   // false
+    const char* trunc      = "";   // the "..." suffix
+    const char* type_int   = "";   // schema: integer type names
+    const char* type_float = "";   // schema: float type names
+    const char* type_str   = "";   // schema: string/binary type names
+    const char* type_time  = "";   // schema: temporal type names
+    const char* type_bool  = "";   // schema: bool type names
+    const char* type_other = "";   // schema: everything else
+    const char* meta_key   = "";   // summary labels ("File:", "Row groups:", …)
+};
+
+static Colors g_color;  // populated by init_colors()
+
+static void init_colors() {
+    g_color.reset      = "\033[0m";
+    g_color.border     = "\033[90m";       // dark gray
+    g_color.header     = "\033[1;97m";     // bold bright-white
+    g_color.row_idx    = "\033[90m";       // dark gray
+    g_color.null_val   = "\033[2;3m";      // dim + italic
+    g_color.number     = "\033[96m";       // bright cyan
+    g_color.bool_true  = "\033[92m";       // bright green
+    g_color.bool_false = "\033[33m";       // yellow
+    g_color.trunc      = "\033[90m";       // dark gray for "..."
+    g_color.type_int   = "\033[96m";       // bright cyan
+    g_color.type_float = "\033[93m";       // bright yellow
+    g_color.type_str   = "\033[92m";       // bright green
+    g_color.type_time  = "\033[95m";       // bright magenta
+    g_color.type_bool  = "\033[94m";       // bright blue
+    g_color.type_other = "\033[37m";       // white
+    g_color.meta_key   = "\033[1m";        // bold
+}
+
+// Pick the right color for an Arrow type in the schema summary
+static const char* type_color(arrow::Type::type t) {
+    switch (t) {
+        case arrow::Type::INT8:  case arrow::Type::INT16:
+        case arrow::Type::INT32: case arrow::Type::INT64:
+        case arrow::Type::UINT8: case arrow::Type::UINT16:
+        case arrow::Type::UINT32: case arrow::Type::UINT64:
+        case arrow::Type::DECIMAL128: case arrow::Type::DECIMAL256:
+            return g_color.type_int;
+        case arrow::Type::FLOAT: case arrow::Type::DOUBLE:
+        case arrow::Type::HALF_FLOAT:
+            return g_color.type_float;
+        case arrow::Type::STRING: case arrow::Type::LARGE_STRING:
+        case arrow::Type::BINARY: case arrow::Type::LARGE_BINARY:
+        case arrow::Type::FIXED_SIZE_BINARY:
+            return g_color.type_str;
+        case arrow::Type::DATE32: case arrow::Type::DATE64:
+        case arrow::Type::TIME32: case arrow::Type::TIME64:
+        case arrow::Type::TIMESTAMP: case arrow::Type::DURATION:
+            return g_color.type_time;
+        case arrow::Type::BOOL:
+            return g_color.type_bool;
+        default:
+            return g_color.type_other;
+    }
+}
+
+// Unwrap dictionary to its value type for coloring purposes
+static arrow::Type::type display_type(const arrow::Field& f) {
+    auto t = f.type();
+    if (t->id() == arrow::Type::DICTIONARY)
+        return std::static_pointer_cast<arrow::DictionaryType>(t)->value_type()->id();
+    return t->id();
+}
 
 // ── CLI args ─────────────────────────────────────────────────────────────────
 
+enum class ColorMode { Auto, Always, Never };
+
 struct Config {
     std::string path;
-    int         head_rows   = 10;
-    int         max_col_w   = 32;   // max chars per cell (truncated with …)
-    int         max_cols    = 0;    // 0 = all
-    bool        no_index    = false;
+    int         head_rows  = 10;
+    int         max_col_w  = 32;
+    int         max_cols   = 0;
+    bool        no_index   = false;
+    ColorMode   color      = ColorMode::Auto;
 };
 
 static void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options] <file.parquet>\n"
-        "  -n <rows>   number of rows to display (default 10, 0 = all)\n"
-        "  -w <width>  max column cell width     (default 32)\n"
-        "  -c <cols>   max columns to show       (default all)\n"
-        "  --no-index  suppress row-index column\n"
-        "  -h          show this help\n",
+        "  -n <rows>          number of rows to display (default 10, 0 = all)\n"
+        "  -w <width>         max column cell width     (default 32)\n"
+        "  -c <cols>          max columns to show       (default all)\n"
+        "  --no-index         suppress row-index column\n"
+        "  --color[=WHEN]     colorize output: auto (default), always, never\n"
+        "  -h                 show this help\n",
         prog);
 }
 
@@ -49,9 +130,16 @@ static Config parse_args(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "-n") && i + 1 < argc) {
             cfg.head_rows = std::atoi(argv[++i]);
         } else if (!std::strcmp(argv[i], "-w") && i + 1 < argc) {
-            cfg.max_col_w = std::max(3, std::atoi(argv[++i]));
+            cfg.max_col_w = std::max(4, std::atoi(argv[++i]));
         } else if (!std::strcmp(argv[i], "-c") && i + 1 < argc) {
             cfg.max_cols = std::atoi(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--color") ||
+                   !std::strcmp(argv[i], "--color=auto")) {
+            cfg.color = ColorMode::Auto;
+        } else if (!std::strcmp(argv[i], "--color=always")) {
+            cfg.color = ColorMode::Always;
+        } else if (!std::strcmp(argv[i], "--color=never")) {
+            cfg.color = ColorMode::Never;
         } else if (argv[i][0] != '-') {
             if (positional++ == 0) cfg.path = argv[i];
         } else {
@@ -82,19 +170,14 @@ static bool is_numeric_type(arrow::Type::type t) {
     }
 }
 
-// Truncate to max_w *display* characters.
-// We assume content is ASCII or that bytes ≈ display chars (good enough for a preview).
-// Using ASCII "…" (three dots) keeps byte count == display width.
 static std::string truncate(const std::string& s, int max_w) {
     if (max_w < 4) max_w = 4;
     if ((int)s.size() <= max_w) return s;
     return s.substr(0, max_w - 3) + "...";
 }
 
-// Return the display width of a string (bytes for ASCII/Latin; approximation for UTF-8).
-// Good enough for column alignment in a terminal preview.
 static int display_width(const std::string& s) {
-    return (int)s.size();  // fast path: treat as ASCII
+    return (int)s.size();
 }
 
 static std::string cell_to_string(const arrow::Array& arr, int64_t row) {
@@ -129,14 +212,10 @@ static std::string cell_to_string(const arrow::Array& arr, int64_t row) {
             ss << std::setprecision(8) << static_cast<const arrow::DoubleArray&>(arr).Value(row);
             return ss.str();
         }
-        case arrow::Type::STRING: {
-            auto& a = static_cast<const arrow::StringArray&>(arr);
-            return a.GetString(row);
-        }
-        case arrow::Type::LARGE_STRING: {
-            auto& a = static_cast<const arrow::LargeStringArray&>(arr);
-            return a.GetString(row);
-        }
+        case arrow::Type::STRING:
+            return static_cast<const arrow::StringArray&>(arr).GetString(row);
+        case arrow::Type::LARGE_STRING:
+            return static_cast<const arrow::LargeStringArray&>(arr).GetString(row);
         case arrow::Type::BINARY: {
             auto& a = static_cast<const arrow::BinaryArray&>(arr);
             return "<binary " + std::to_string(a.value_length(row)) + "B>";
@@ -146,13 +225,9 @@ static std::string cell_to_string(const arrow::Array& arr, int64_t row) {
             return "<binary " + std::to_string(a.value_length(row)) + "B>";
         }
         case arrow::Type::DICTIONARY: {
-            // Decode index → look up actual value in the dictionary array.
-            // DictionaryScalar::ToString() dumps the entire dictionary, so we
-            // do the lookup manually.
             auto& dict_arr = static_cast<const arrow::DictionaryArray&>(arr);
-            auto  dict     = dict_arr.dictionary();   // values array
-            auto  indices  = dict_arr.indices();      // integer index array
-
+            auto  dict     = dict_arr.dictionary();
+            auto  indices  = dict_arr.indices();
             int64_t idx = -1;
             switch (indices->type_id()) {
                 case arrow::Type::INT8:   idx = static_cast<const arrow::Int8Array&>(*indices).Value(row);   break;
@@ -170,9 +245,8 @@ static std::string cell_to_string(const arrow::Array& arr, int64_t row) {
             return "null";
         }
         default: {
-            auto scalar_res = arr.GetScalar(row);
-            if (scalar_res.ok()) return scalar_res.ValueOrDie()->ToString();
-            return "?";
+            auto res = arr.GetScalar(row);
+            return res.ok() ? res.ValueOrDie()->ToString() : "?";
         }
     }
 }
@@ -182,38 +256,90 @@ static std::string cell_to_string(const arrow::Array& arr, int64_t row) {
 struct Column {
     std::string              header;
     bool                     right_align;
+    bool                     is_index = false;
+    bool                     is_bool  = false;
     std::vector<std::string> cells;
     int                      width;
 };
 
 static void draw_separator(const std::vector<Column>& cols) {
-    std::putchar('+');
+    std::printf("%s+", g_color.border);
     for (auto& c : cols) {
         for (int i = 0; i < c.width + 2; ++i) std::putchar('-');
         std::putchar('+');
     }
-    std::putchar('\n');
+    std::printf("%s\n", g_color.reset);
+}
+
+// Emit one cell with color, proper padding, but no border characters.
+// Returns nothing; writes directly to stdout.
+static void emit_cell(const Column& col, const std::string& val,
+                      bool right_align, bool is_header) {
+    int pad = col.width - display_width(val);
+
+    // Choose foreground color for the content
+    const char* fg = "";
+    if (*g_color.reset) {
+        if (is_header) {
+            fg = g_color.header;
+        } else if (col.is_index) {
+            fg = g_color.row_idx;
+        } else if (val == "null") {
+            fg = g_color.null_val;
+        } else if (col.is_bool) {
+            fg = (val == "true") ? g_color.bool_true : g_color.bool_false;
+        } else if (right_align) {
+            fg = g_color.number;
+        }
+    }
+
+    // For truncated values, split the "..." suffix and dim it separately
+    bool truncated = !is_header && val.size() >= 3 &&
+                     val.compare(val.size() - 3, 3, "...") == 0;
+
+    if (right_align) {
+        std::printf(" %*s", pad, "");   // leading spaces (no color)
+        if (truncated) {
+            std::printf("%s%.*s%s%s%s%s",
+                fg, (int)val.size() - 3, val.c_str(),   // body
+                g_color.reset, g_color.trunc, "...", g_color.reset);
+        } else {
+            std::printf("%s%s%s", fg, val.c_str(), *fg ? g_color.reset : "");
+        }
+    } else {
+        if (truncated) {
+            std::printf(" %s%.*s%s%s%s%s%*s",
+                fg, (int)val.size() - 3, val.c_str(),   // body
+                g_color.reset, g_color.trunc, "...", g_color.reset,
+                pad, "");
+        } else {
+            std::printf(" %s%s%s%*s",
+                fg, val.c_str(), *fg ? g_color.reset : "", pad, "");
+        }
+    }
 }
 
 static void draw_row(const std::vector<Column>& cols,
                      const std::vector<std::string>& vals,
-                     const std::vector<bool>& right_align) {
-    std::putchar('|');
+                     const std::vector<bool>& right_align,
+                     bool is_header = false) {
     for (std::size_t i = 0; i < cols.size(); ++i) {
-        int pad = cols[i].width - display_width(vals[i]);
-        if (right_align[i]) {
-            std::printf(" %*s%s |", pad, "", vals[i].c_str());
-        } else {
-            std::printf(" %s%*s |", vals[i].c_str(), pad, "");
-        }
+        std::printf("%s|%s", g_color.border, g_color.reset);
+        emit_cell(cols[i], vals[i], right_align[i], is_header);
+        std::printf(" ");
     }
-    std::putchar('\n');
+    std::printf("%s|%s\n", g_color.border, g_color.reset);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
     Config cfg = parse_args(argc, argv);
+
+    // Initialise colors
+    bool use_color = (cfg.color == ColorMode::Always) ||
+                     (cfg.color == ColorMode::Auto && isatty(STDOUT_FILENO));
+    if (use_color) init_colors();
 
     // --- Open parquet file ---
     auto maybe_file = arrow::io::ReadableFile::Open(cfg.path);
@@ -224,7 +350,6 @@ int main(int argc, char** argv) {
     }
     auto infile = maybe_file.ValueOrDie();
 
-    // Build reader with properties
     parquet::ArrowReaderProperties arrow_props = parquet::default_arrow_reader_properties();
     arrow_props.set_pre_buffer(true);
     if (cfg.head_rows > 0) arrow_props.set_batch_size(cfg.head_rows);
@@ -258,16 +383,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // --- Determine which columns to show ---
     int show_cols = (cfg.max_cols > 0)
                     ? std::min(cfg.max_cols, (int)schema->num_fields())
                     : (int)schema->num_fields();
 
-    // --- Read only enough row groups for head_rows ---
     int64_t rows_wanted = (cfg.head_rows <= 0) ? total_rows : (int64_t)cfg.head_rows;
 
     std::vector<int> col_indices;
-    col_indices.reserve(show_cols);
     for (int i = 0; i < show_cols; ++i) col_indices.push_back(i);
 
     std::vector<int> rg_ids;
@@ -298,10 +420,10 @@ int main(int argc, char** argv) {
         Column idx;
         idx.header      = "";
         idx.right_align = true;
+        idx.is_index    = true;
         int digits = 1;
         for (int64_t v = std::max<int64_t>(n_display - 1, 0); v >= 10; v /= 10) ++digits;
         idx.width = digits;
-        idx.cells.reserve(n_display);
         for (int64_t r = 0; r < n_display; ++r)
             idx.cells.push_back(std::to_string(r));
         columns.push_back(std::move(idx));
@@ -314,8 +436,8 @@ int main(int argc, char** argv) {
         Column col;
         col.header      = field->name();
         col.right_align = is_numeric_type(field->type()->id());
+        col.is_bool     = (display_type(*field) == arrow::Type::BOOL);
         col.width       = std::max(display_width(col.header), 4);
-        col.cells.reserve(n_display);
 
         for (auto& chunk : arr_col->chunks()) {
             for (int64_t r = 0; r < chunk->length(); ++r) {
@@ -330,8 +452,6 @@ int main(int argc, char** argv) {
         columns.push_back(std::move(col));
     }
 
-    bool cols_truncated = (show_cols < num_cols);
-
     // --- Draw table ---
     draw_separator(columns);
 
@@ -339,31 +459,28 @@ int main(int argc, char** argv) {
         std::vector<std::string> hdr;
         std::vector<bool> ra;
         for (auto& c : columns) { hdr.push_back(c.header); ra.push_back(false); }
-        draw_row(columns, hdr, ra);
+        draw_row(columns, hdr, ra, /*is_header=*/true);
     }
     draw_separator(columns);
 
     for (int64_t r = 0; r < n_display; ++r) {
         std::vector<std::string> row;
         std::vector<bool> ra;
-        for (auto& c : columns) {
-            row.push_back(c.cells[r]);
-            ra.push_back(c.right_align);
-        }
+        for (auto& c : columns) { row.push_back(c.cells[r]); ra.push_back(c.right_align); }
         draw_row(columns, row, ra);
     }
     draw_separator(columns);
 
-    if (cols_truncated)
+    if (show_cols < num_cols)
         std::printf("  ... %d more column(s) not shown (-c 0 to see all)\n",
                     num_cols - show_cols);
 
     // --- Summary ---
-    std::printf("\n[%lld rows x %d columns]\n", (long long)total_rows, num_cols);
+    std::printf("\n%s[%lld rows x %d columns]%s\n",
+                g_color.meta_key, (long long)total_rows, num_cols, g_color.reset);
 
     // Schema table
-    int name_w = 6;  // "Column"
-    int type_w = 4;  // "Type"
+    int name_w = 6, type_w = 4;
     for (int ci = 0; ci < (int)schema->num_fields(); ++ci) {
         auto f = schema->field(ci);
         name_w = std::max(name_w, (int)f->name().size());
@@ -372,17 +489,22 @@ int main(int argc, char** argv) {
     name_w = std::min(name_w, 40);
     type_w = std::min(type_w, 40);
 
-    std::printf("\n%-*s  %-*s  Nullable\n", name_w, "Column", type_w, "Type");
-    std::printf("%s  %s  --------\n",
+    std::printf("\n%s%-*s  %-*s  Nullable%s\n",
+                g_color.header, name_w, "Column", type_w, "Type", g_color.reset);
+    std::printf("%s%s  %s  --------%s\n",
+                g_color.border,
                 std::string(name_w, '-').c_str(),
-                std::string(type_w, '-').c_str());
+                std::string(type_w, '-').c_str(),
+                g_color.reset);
+
     for (int ci = 0; ci < (int)schema->num_fields(); ++ci) {
         auto f = schema->field(ci);
         std::string fname = truncate(f->name(), name_w);
         std::string ftype = truncate(f->type()->ToString(), type_w);
-        std::printf("%-*s  %-*s  %s\n",
+        const char* tc    = *g_color.reset ? type_color(display_type(*f)) : "";
+        std::printf("%-*s  %s%-*s%s  %s\n",
                     name_w, fname.c_str(),
-                    type_w, ftype.c_str(),
+                    tc, type_w, ftype.c_str(), g_color.reset,
                     f->nullable() ? "yes" : "no");
     }
 
@@ -392,7 +514,7 @@ int main(int argc, char** argv) {
         total_size += file_meta->RowGroup(rg)->total_compressed_size();
 
     char size_buf[32];
-    if (total_size < 1024)
+    if      (total_size < 1024)
         std::snprintf(size_buf, sizeof(size_buf), "%lld B", (long long)total_size);
     else if (total_size < 1024 * 1024)
         std::snprintf(size_buf, sizeof(size_buf), "%.1f KiB", total_size / 1024.0);
@@ -401,10 +523,15 @@ int main(int argc, char** argv) {
     else
         std::snprintf(size_buf, sizeof(size_buf), "%.2f GiB", total_size / (1024.0 * 1024 * 1024));
 
-    std::printf("\nFile: %s\n", cfg.path.c_str());
-    std::printf("Row groups: %d  |  Compressed size: %s\n", num_rg, size_buf);
+    std::printf("\n%sFile:%s %s\n",
+                g_color.meta_key, g_color.reset, cfg.path.c_str());
+    std::printf("%sRow groups:%s %d  %s|%s  %sCompressed size:%s %s\n",
+                g_color.meta_key, g_color.reset, num_rg,
+                g_color.border, g_color.reset,
+                g_color.meta_key, g_color.reset, size_buf);
     if (!file_meta->created_by().empty())
-        std::printf("Created by: %s\n", file_meta->created_by().c_str());
+        std::printf("%sCreated by:%s %s\n",
+                    g_color.meta_key, g_color.reset, file_meta->created_by().c_str());
 
     return 0;
 }
