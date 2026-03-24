@@ -105,17 +105,24 @@ struct Config {
     int         max_cols   = 0;
     bool        no_index   = false;
     ColorMode   color      = ColorMode::Auto;
+    char        delimiter  = 0;    // 0 = table mode; '\t' or ',' = delimited output
 };
 
 static void print_usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s [options] <file.parquet>\n"
+        "\nTable options:\n"
         "  -n <rows>          number of rows to display (default 10, 0 = all)\n"
         "  -w <width>         max column cell width     (default 32)\n"
         "  -c <cols>          max columns to show       (default all)\n"
         "  --no-index         suppress row-index column\n"
         "  --color[=WHEN]     colorize output: auto (default), always, never\n"
-        "  -h                 show this help\n",
+        "\nDelimited output (replaces table view):\n"
+        "  --tsv              write tab-separated values to stdout\n"
+        "  --csv              write comma-separated values to stdout\n"
+        "  --delimiter <sep>  write with a custom single-character delimiter\n"
+        "  (with delimited output -n defaults to all rows; -c still applies)\n"
+        "\n  -h                 show this help\n",
         prog);
 }
 
@@ -140,6 +147,16 @@ static Config parse_args(int argc, char** argv) {
             cfg.color = ColorMode::Always;
         } else if (!std::strcmp(argv[i], "--color=never")) {
             cfg.color = ColorMode::Never;
+        } else if (!std::strcmp(argv[i], "--tsv")) {
+            cfg.delimiter = '\t';
+        } else if (!std::strcmp(argv[i], "--csv")) {
+            cfg.delimiter = ',';
+        } else if (!std::strcmp(argv[i], "--delimiter") && i + 1 < argc) {
+            const char* sep = argv[++i];
+            if (!std::strcmp(sep, "tab"))   cfg.delimiter = '\t';
+            else if (!std::strcmp(sep, "comma")) cfg.delimiter = ',';
+            else if (sep[0] && !sep[1])     cfg.delimiter = sep[0];
+            else { std::fprintf(stderr, "delimiter must be a single character\n"); std::exit(1); }
         } else if (argv[i][0] != '-') {
             if (positional++ == 0) cfg.path = argv[i];
         } else {
@@ -331,6 +348,103 @@ static void draw_row(const std::vector<Column>& cols,
     std::printf("%s|%s\n", g_color.border, g_color.reset);
 }
 
+// ── Delimited output ─────────────────────────────────────────────────────────
+
+// RFC 4180 quoting: wrap in double-quotes if the value contains the delimiter,
+// a double-quote, or a newline; escape embedded quotes by doubling them.
+static void write_csv_field(const std::string& val, char sep) {
+    bool needs_quote = val.find(sep)  != std::string::npos ||
+                       val.find('"')  != std::string::npos ||
+                       val.find('\n') != std::string::npos ||
+                       val.find('\r') != std::string::npos;
+    if (!needs_quote) {
+        std::fputs(val.c_str(), stdout);
+        return;
+    }
+    std::putchar('"');
+    for (char c : val) {
+        if (c == '"') std::putchar('"');   // double the quote
+        std::putchar(c);
+    }
+    std::putchar('"');
+}
+
+// Stream the full file (or up to head_rows) as delimited text, one row group
+// at a time so memory use stays bounded regardless of file size.
+static void write_delimited(parquet::arrow::FileReader* reader,
+                             const std::shared_ptr<arrow::Schema>& schema,
+                             const parquet::FileMetaData* meta,
+                             const Config& cfg) {
+    char sep = cfg.delimiter;
+    int  show_cols  = (cfg.max_cols > 0)
+                      ? std::min(cfg.max_cols, (int)schema->num_fields())
+                      : (int)schema->num_fields();
+    // In delimiter mode default to all rows unless -n was given explicitly.
+    // We detect "explicitly given" by checking head_rows != the sentinel 10…
+    // Simpler: just honour whatever head_rows holds (caller sets 0 = all).
+    int64_t rows_left = (cfg.head_rows <= 0) ? INT64_MAX : (int64_t)cfg.head_rows;
+
+    std::vector<int> col_indices;
+    for (int i = 0; i < show_cols; ++i) col_indices.push_back(i);
+
+    // Header row
+    for (int ci = 0; ci < show_cols; ++ci) {
+        if (ci) std::putchar(sep);
+        write_csv_field(schema->field(ci)->name(), sep);
+    }
+    std::putchar('\n');
+
+    // Data rows — one row group at a time
+    for (int rg = 0; rg < meta->num_row_groups() && rows_left > 0; ++rg) {
+        std::shared_ptr<arrow::Table> table;
+        auto st = reader->ReadRowGroups({rg}, col_indices, &table);
+        if (!st.ok()) {
+            std::fprintf(stderr, "Warning: error reading row group %d: %s\n",
+                         rg, st.ToString().c_str());
+            continue;
+        }
+
+        int64_t rg_rows = std::min(table->num_rows(), rows_left);
+        rows_left -= rg_rows;
+
+        // Flatten each column's chunks into a single array list we can index
+        // cheaply without copying data.
+        struct ChunkCursor {
+            const arrow::ChunkedArray* col;
+            int    chunk_idx  = 0;
+            int64_t row_in_chunk = 0;
+
+            const arrow::Array& current() const {
+                return *col->chunk(chunk_idx);
+            }
+            void advance() {
+                ++row_in_chunk;
+                if (row_in_chunk >= col->chunk(chunk_idx)->length()) {
+                    ++chunk_idx;
+                    row_in_chunk = 0;
+                }
+            }
+        };
+
+        std::vector<ChunkCursor> cursors;
+        cursors.reserve(show_cols);
+        for (int ci = 0; ci < show_cols; ++ci)
+            cursors.push_back({table->column(ci).get()});
+
+        for (int64_t r = 0; r < rg_rows; ++r) {
+            for (int ci = 0; ci < show_cols; ++ci) {
+                if (ci) std::putchar(sep);
+                auto& cur = cursors[ci];
+                std::string val = cell_to_string(cur.current(), cur.row_in_chunk);
+                // nulls → empty field (standard CSV convention)
+                if (val != "null") write_csv_field(val, sep);
+                cur.advance();
+            }
+            std::putchar('\n');
+        }
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -381,6 +495,15 @@ int main(int argc, char** argv) {
     if (!schema_st.ok()) {
         std::fprintf(stderr, "Error reading schema: %s\n", schema_st.ToString().c_str());
         return 1;
+    }
+
+    // ── Delimited output mode ─────────────────────────────────────────────────
+    if (cfg.delimiter) {
+        // Default to all rows in delimiter mode (user can still pass -n)
+        Config dcfg = cfg;
+        if (dcfg.head_rows == 10) dcfg.head_rows = 0;   // 10 is the unchanged default
+        write_delimited(arrow_reader.get(), schema, file_meta.get(), dcfg);
+        return 0;
     }
 
     int show_cols = (cfg.max_cols > 0)
